@@ -4,6 +4,18 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <string>
+#include <cmath>
+#include <strsafe.h>
+
+#define IDM_EDUNDO 1001
+#define IDM_EDCUT 1002
+#define IDM_EDCOPY 1003
+#define IDM_EDPASTE 1004
+#define IDM_EDDEL 1005
+#define IDM_ABOUT 1006
+
+#define ID_EDITCHILD 100
 
 #define NEWFILE 0x3E9
 #define OPENFILE 0x3EA
@@ -27,6 +39,7 @@ void debug();
 
 LPRECT WindowRect;
 
+RECT rect;
 RECT NewFileRect;
 RECT EditorHeaderRect;
 RECT HeaderMenu;
@@ -36,7 +49,21 @@ HWND hwndNewFileButton;
 HWND hwndEditorNewFileButton;
 HWND hwndEditorRecentFileButton;
 HWND hwndEditorThemeButton;
+HWND hwndEditorTextFile;
 HWND hwnd;
+HWND hwndEdit;
+
+HANDLE hFile;
+
+struct FileContent
+{
+    std::string strTitle;
+    std::string strText;
+};
+
+TCHAR test[] = TEXT("Hello World!");
+
+struct FileContent fileContent;
 
 int Theme = LIGHT_MODE;
 
@@ -47,6 +74,7 @@ struct WinConst
     LPSTR lpCmdLine;
     int nCmdShow;
 };
+
 const wchar_t CLASS_NAME[] = L"MainMenu";
 
 struct WinConst _WinConst;
@@ -90,6 +118,8 @@ extern "C" int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPST
         return 0;
     }
 
+    GetClientRect(hwnd, &rect);
+
     ShowWindow(hwnd, SW_SHOW);
 
     WindowState = MAINMENU;
@@ -120,9 +150,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             switch (LOWORD(wParam))
             {
             case NEWFILE:
-                WindowState = EDITOR;
                 InvalidateRect(hwnd, WindowRect, true);
                 ShowWindow(hwndNewFileButton, SW_HIDE);
+                WindowState = EDITOR;
                 break;
             case OPENFILE:
 
@@ -132,6 +162,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 if (Theme > NERD_MODE)
                     Theme = LIGHT_MODE;
                 InvalidateRect(hwnd, WindowRect, true);
+                WindowState = EDITOR;
                 break;
             }
         }
@@ -211,17 +242,19 @@ void Editor(HDC hdc, PAINTSTRUCT &ps)
                             */
 
     // Open a handle to the file
-    HANDLE hFile = CreateFile(
-        L"C:\\NewFile.txt",    // Filename
-        GENERIC_WRITE,         // Desired access
-        FILE_SHARE_READ,       // Share mode
-        NULL,                  // Security attributes
-        CREATE_NEW,            // Creates a new file, only if it doesn't already exist
-        FILE_ATTRIBUTE_NORMAL, // Flags and attributes
-        NULL);                 // Template file handle
+    hFile = CreateFile(
+        L"E:\\Users\\penan\\Downloads\\ATextFile.txt", // Filename
+        GENERIC_WRITE,                                 // Desired access
+        FILE_SHARE_READ,                               // Share mode
+        NULL,                                          // Security attributes
+        CREATE_NEW,                                    // Creates a new file, only if it doesn't already exist
+        FILE_ATTRIBUTE_NORMAL,                         // Flags and attributes
+        NULL);                                         // Template file handle
     if (hFile == INVALID_HANDLE_VALUE)
     {
-        // Failed to open/create file
+        WindowState = EDITOR;
+        InvalidateRect(hwnd, WindowRect, true);
+        ShowWindow(hwndNewFileButton, SW_HIDE);
     }
 
     HFONT hFontHeaderButton = CreateFontW(
@@ -279,10 +312,37 @@ void Editor(HDC hdc, PAINTSTRUCT &ps)
     SendMessage(hwndEditorRecentFileButton, WM_SETFONT, (WPARAM)hFontHeaderButton, TRUE);
     SendMessage(hwndEditorThemeButton, WM_SETFONT, (WPARAM)hFontHeaderButton, TRUE);
 
+    DrawText(hdc, test, -1, &rect, DT_SINGLELINE | DT_NOCLIP | DT_LEFT | DT_VCENTER);
+
     ShowWindow(hwndEditorNewFileButton, SW_SHOW);
     ShowWindow(hwndEditorRecentFileButton, SW_SHOW);
+    ShowWindow(hwndEdit, SW_SHOW);
 
     FillRect(hdc, &HeaderMenu, (HBRUSH)(COLOR_WINDOW + 2));
+
+    hwndEditorTextFile = CreateWindow(
+        L"TextEditor",                                                            // Predefined class; Unicode assumed
+        L"New file",                                                              // Button text
+        WS_TABSTOP | WS_VISIBLE | WS_CHILD | WS_SIZEBOX | WS_VSCROLL | WS_BORDER, // Styles
+        EditorHeaderRect.right,                                                   // x position
+        EditorHeaderRect.top,                                                     // y position
+        EditorHeaderRect.left,                                                    // Button width
+        EditorHeaderRect.bottom - EditorHeaderRect.top,                           // Button height
+        hwnd,                                                                     // Parent window
+        (HMENU)NEWFILE,                                                           // No menu.
+        (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
+        NULL); // Pointer not needed.
+
+    DWORD bytesWritten;
+
+    WriteFile(
+        hFile,                       // Handle to the file
+        fileContent.strText.c_str(), // Buffer to write
+        fileContent.strText.size(),  // Buffer size
+        &bytesWritten,               // Bytes written
+        nullptr);                    // Overlapped
+
+    CloseHandle(hFile);
 }
 
 void MainMenu(HDC hdc, PAINTSTRUCT &ps)

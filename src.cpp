@@ -7,13 +7,10 @@
 #include <string>
 #include <cmath>
 #include <strsafe.h>
+#include <vector>
 
-#define IDM_EDUNDO 1001
-#define IDM_EDCUT 1002
-#define IDM_EDCOPY 1003
-#define IDM_EDPASTE 1004
-#define IDM_EDDEL 1005
-#define IDM_ABOUT 1006
+#define BUFSIZE 65535
+#define SHIFTED 0x8000
 
 #define ID_EDITCHILD 100
 
@@ -28,18 +25,47 @@
 #define DARK_MODE_DARKER 3
 #define NERD_MODE 4
 
-int WindowState;
+int WindowState;           // records the current state of the hwnd window
+HDC hdc;                   // handle to device context
+TEXTMETRIC tm;             // structure for text metrics
+static DWORD dwCharX;      // average width of characters
+static DWORD dwCharY;      // height of characters
+static DWORD dwClientX;    // width of client area
+static DWORD dwClientY;    // height of client area
+static DWORD dwLineLen;    // line length
+static DWORD dwLines;      // text lines in client area
+static int nCaretPosX = 0; // horizontal position of caret
+static int nCaretPosY = 0; // vertical position of caret
+static int nCharWidth = 0; // width of a character
+static int cch = 0;        // characters in buffer
+static int nCurChar = 0;   // index of current character
+static PTCHAR pchInputBuf; // input buffer
+static int *lineWidth;     // Buffer to store every line's summation of character width
+static int lineCount;      // Number of lines
+int i, j;                  // loop counters
+int cCR = 0;               // count of carriage returns
+int nCRIndex = 0;          // index of last carriage return
+int nVirtKey;              // virtual-key code
+TCHAR szBuf[128];          // temporary buffer
+TCHAR ch;                  // current character
+PAINTSTRUCT ps;            // required by BeginPaint
+SIZE sz;                   // string dimensions
+COLORREF crPrevText;       // previous text color
+COLORREF crPrevBk;         // previous background color
+size_t *pcch;
+HRESULT hResult;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
-void Editor(HDC hdc, PAINTSTRUCT &ps);
+void EditorWindow(HDC hdc, PAINTSTRUCT &ps);
 
 void MainMenu(HDC hdc, PAINTSTRUCT &ps);
-void debug();
+void debug(LPCWSTR text);
 
 LPRECT WindowRect;
 
-RECT rect;
+RECT EditorRect;
+RECT _WindowRect;
 RECT NewFileRect;
 RECT EditorHeaderRect;
 RECT HeaderMenu;
@@ -61,7 +87,7 @@ struct FileContent
     std::string strText;
 };
 
-TCHAR test[] = TEXT("Hello World!");
+TCHAR Content[] = TEXT("Hello World!");
 
 struct FileContent fileContent;
 
@@ -118,7 +144,7 @@ extern "C" int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPST
         return 0;
     }
 
-    GetClientRect(hwnd, &rect);
+    GetClientRect(hwnd, &_WindowRect);
 
     ShowWindow(hwnd, SW_SHOW);
 
@@ -132,6 +158,7 @@ extern "C" int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPST
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+
     return 0;
 }
 
@@ -140,10 +167,353 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
+    case WM_CREATE:
+
+        /*          RECORDING NECESSARY INFORMATION FOR THE CURRENT FONT          */
+
+        // Get a handler/reference to the current device's grahics information
+        // aka get the metrics/information inside the device.
+        hdc = GetDC(hwnd);
+        // Specifically extract the metrics regarding texts
+        GetTextMetrics(hdc, &tm);
+        // Free up the handler
+        ReleaseDC(hwnd, hdc);
+
+        // Save the average character width and height.
+        // For its length
+        dwCharX = tm.tmAveCharWidth;
+        // For its height
+        dwCharY = tm.tmHeight;
+
+        // Allocate a buffer to store keyboard input.
+        // aka an array to store the individual characters
+        pchInputBuf = (LPTSTR)GlobalAlloc(GPTR,
+                                          BUFSIZE * sizeof(TCHAR));
+        return 0;
+
+    case WM_SIZE:
+
+        /*          TRACKING THE ROW AND COLUMNS OF CHARACTERS          */
+
+        // Save the new width and height of the client area.
+        // The literal area of the screen where a character
+        // would be displayed
+        dwClientX = LOWORD(lParam);
+        dwClientY = HIWORD(lParam);
+
+        // Calculate the maximum width of a line and the
+        // maximum number of lines in the client area.
+        // Keeping track of how long has the client area has taken
+        dwLineLen = dwClientX - dwCharX;
+        // Keeping track of the vertical area taken
+        dwLines = dwClientY / dwCharY;
+        break;
+
+    case WM_SETFOCUS:
+        /*          PREPARING THE CARET (CARETS ARE WHERE EACH CHARACTER WILL BE DISPLAYED)          */
+
+        // Create, position, and display the caret when the
+        // window receives the keyboard focus.
+        CreateCaret(hwnd, (HBITMAP)1, 0, dwCharY);
+        SetCaretPos(nCaretPosX, nCaretPosY * dwCharY + HeaderMenu.bottom);
+        ShowCaret(hwnd);
+        break;
+
+    case WM_KILLFOCUS:
+        /*          KILLING THE CARET'S FOCUS ESSENTIALLY HALTING THE DISPLAY OF ANY TEXT INPUT          */
+
+        // Hide and destroy the caret when the window loses the
+        // keyboard focus.
+        HideCaret(hwnd);
+        DestroyCaret();
+        break;
+
+    case WM_CHAR:
+        /*                           TEXT INPUT                                             */
+
+        // check if current location is close enough to the
+        // end of the buffer that a buffer overflow may
+        // occur. If so, add null and display contents.
+        // I don't know why -5
+        if (cch > BUFSIZE - 5)
+        {
+            // Set the first character to 0
+            pchInputBuf[cch] = 0x00;
+            // This one is to repaint the window
+            // SendMessage(hwnd, WM_PAINT, 0, 0);
+        }
+        switch (wParam)
+        {
+        case 0x08: // backspace
+
+            ShowCaret(hwnd);
+
+            // Get the current char
+            ch = pchInputBuf[--nCurChar];
+            hdc = GetDC(hwnd);
+            // Get that current char's width
+            GetCharWidth32(hdc, (UINT)ch, (UINT)ch,
+                           &nCharWidth);
+            // Subtract the width to the carets x-axis position
+            nCaretPosX -= nCharWidth;
+            // Release the character in the buffer.
+            cch--;
+            ch = (TCHAR)0x20;
+            TextOut(hdc, nCaretPosX, (nCaretPosY * dwCharY) + HeaderMenu.bottom,
+                    &ch, 2);
+            ReleaseDC(hwnd, hdc);
+            
+            // If at the far left
+            if ((DWORD)nCaretPosX <= 0)
+            {
+                // Get the current char
+                nCaretPosX = pchInputBuf[--nCurChar];
+                cch--;
+                pchInputBuf[cch] = 0x0D;
+                --nCaretPosY;
+            }
+
+            nCurChar = cch;
+            SetCaretPos(nCaretPosX, nCaretPosY / dwCharY + HeaderMenu.bottom);
+        case 0x0A: // linefeed
+        case 0x1B: // escape
+            MessageBeep((UINT)-1);
+            return 0;
+
+        case 0x09: // tab
+
+            // Convert tabs to four consecutive spaces.
+            for (i = 0; i < 4; i++)
+                // 0x20 so that it goes to the default case which is also
+                // a displayable character but is a white-space
+                SendMessage(hwnd, WM_CHAR, 0x20, 0);
+            return 0;
+
+        case 0x0D: // carriage return
+
+            // Record the carriage return and position the
+            // caret at the beginning of the new line.
+            pchInputBuf[cch++] = 0x0D; // adds the character code for a carriage return
+            nCaretPosX = 0;            // reset x position
+            nCaretPosY += 1;           // iterate the y position
+            // Record the previous line's length
+
+            break;
+
+        default: // displayable character
+
+            // wParam stores all displayable character codes
+            ch = (TCHAR)wParam;
+            // Temporarily hide the caret so that it doesn't annoy you
+            HideCaret(hwnd);
+            // Retrieve the character's width and output
+            // the character.
+
+            // Notice these operation has happened before, I guess this is to save
+            // resource
+            hdc = GetDC(hwnd);
+            GetCharWidth32(hdc, (UINT)wParam, (UINT)wParam,
+                           &nCharWidth);
+            TextOut(hdc, nCaretPosX, (nCaretPosY * dwCharY) + HeaderMenu.bottom,
+                    &ch, 1);
+            ReleaseDC(hwnd, hdc);
+
+            // Store the character in the buffer.
+            pchInputBuf[cch++] = ch;
+
+            // Calculate the new horizontal position of the
+            // caret. If the position exceeds the maximum,
+            // insert a carriage return and move the caret
+            // to the beginning of the next line.
+            nCaretPosX += nCharWidth;
+            if ((DWORD)nCaretPosX > dwLineLen)
+            {
+                nCaretPosX = 0;
+                pchInputBuf[cch++] = 0x0D;
+                ++nCaretPosY;
+            }
+            nCurChar = cch;
+            ShowCaret(hwnd);
+            break;
+        }
+        SetCaretPos(nCaretPosX, nCaretPosY * dwCharY + HeaderMenu.bottom);
+        break;
+
+    case WM_KEYDOWN:
+        switch (wParam)
+        {
+        case VK_LEFT: // LEFT ARROW
+
+            // The caret can move only to the beginning of
+            // the current line.
+
+            if (nCaretPosX > 0)
+            {
+                HideCaret(hwnd);
+
+                // Retrieve the character to the left of
+                // the caret, calculate the character's
+                // width, then subtract the width from the
+                // current horizontal position of the caret
+                // to obtain the new position.
+                ch = pchInputBuf[--nCurChar];
+
+                hdc = GetDC(hwnd);
+                GetCharWidth32(hdc, ch, ch, &nCharWidth);
+                ReleaseDC(hwnd, hdc);
+                nCaretPosX = std::max(nCaretPosX - nCharWidth,
+                                      0);
+                ShowCaret(hwnd);
+            }
+            break;
+
+        case VK_RIGHT: // RIGHT ARROW
+
+            // Caret moves to the right or, when a carriage
+            // return is encountered, to the beginning of
+            // the next line.
+
+            if (nCurChar < cch)
+            {
+                HideCaret(hwnd);
+
+                // Retrieve the character to the right of
+                // the caret. If it's a carriage return,
+                // position the caret at the beginning of
+                // the next line.
+
+                ch = pchInputBuf[nCurChar];
+
+                if (ch == 0x0D)
+                {
+                    nCaretPosX = 0;
+                    nCaretPosY++;
+                }
+
+                // If the character isn't a carriage
+                // return, check to see whether the SHIFT
+                // key is down. If it is, invert the text
+                // colors and output the character.
+
+                else
+                {
+                    hdc = GetDC(hwnd);
+                    nVirtKey = GetKeyState(VK_SHIFT);
+                    if (nVirtKey & SHIFTED)
+                    {
+                        crPrevText = SetTextColor(hdc,
+                                                  RGB(255, 255, 255));
+                        crPrevBk = SetBkColor(hdc,
+                                              RGB(0, 0, 0));
+                        TextOut(hdc, nCaretPosX,
+                                nCaretPosY * dwCharY,
+                                &ch, 1);
+                        SetTextColor(hdc, crPrevText);
+                        SetBkColor(hdc, crPrevBk);
+                    }
+
+                    // Get the width of the character and
+                    // calculate the new horizontal
+                    // position of the caret.
+
+                    GetCharWidth32(hdc, ch, ch, &nCharWidth);
+                    ReleaseDC(hwnd, hdc);
+                    nCaretPosX = nCaretPosX + nCharWidth;
+                }
+                nCurChar++;
+                ShowCaret(hwnd);
+                break;
+            }
+            break;
+
+        case VK_UP:   // UP ARROW
+        case VK_DOWN: // DOWN ARROW
+            MessageBeep((UINT)-1);
+            return 0;
+
+        case VK_HOME: // HOME
+
+            // Set the caret's position to the upper left
+            // corner of the client area.
+            nCaretPosX = nCaretPosY = 0;
+            nCurChar = 0;
+            break;
+
+        case VK_END: // END
+
+            // Move the caret to the end of the text.
+            for (i = 0; i < cch; i++)
+            {
+                // Count the carriage returns and save the
+                // index of the last one.
+                if (pchInputBuf[i] == 0x0D)
+                {
+                    cCR++;
+                    nCRIndex = i + 1;
+                }
+            }
+            nCaretPosY = cCR;
+
+            // Copy all text between the last carriage
+            // return and the end of the keyboard input
+            // buffer to a temporary buffer.
+            for (i = nCRIndex, j = 0; i < cch; i++, j++)
+                szBuf[j] = pchInputBuf[i];
+            szBuf[j] = TEXT('\0');
+
+            // Retrieve the text extent and use it
+            // to set the horizontal position of the
+            // caret.
+            hdc = GetDC(hwnd);
+            hResult = StringCchLength(szBuf, 128, pcch);
+            if (FAILED(hResult))
+            {
+                // TODO: write error handler
+            }
+            GetTextExtentPoint32(hdc, szBuf, *pcch,
+                                 &sz);
+            nCaretPosX = sz.cx;
+            ReleaseDC(hwnd, hdc);
+            nCurChar = cch;
+            break;
+
+        default:
+            break;
+        }
+        SetCaretPos(nCaretPosX, nCaretPosY * dwCharY);
+        break;
+
+    case WM_PAINT:
+
+        hdc = BeginPaint(hwnd, &ps);
+        HideCaret(hwnd);
+
+        // All painting occurs here, between BeginPaint and EndPaint.
+        FillRect(hdc, &ps.rcPaint, (HBRUSH)GetStockObject(Theme));
+
+        // State machine
+        switch (WindowState)
+        {
+        case MAINMENU:
+            MainMenu(hdc, ps);
+            break;
+        case EDITOR:
+            EditorWindow(hdc, ps);
+            break;
+        }
+        EndPaint(hwnd, &ps);
+        break;
+
     case WM_DESTROY:
         PostQuitMessage(0);
-        return 0;
+
+        // Free the input buffer.
+        GlobalFree((HGLOBAL)pchInputBuf);
+        UnregisterHotKey(hwnd, 0xAAAA);
+        break;
+
     case WM_COMMAND:
+
         // New File
         if (HIWORD(wParam) == BN_CLICKED)
         {
@@ -161,39 +531,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 Theme++;
                 if (Theme > NERD_MODE)
                     Theme = LIGHT_MODE;
-                InvalidateRect(hwnd, WindowRect, true);
                 WindowState = EDITOR;
+                InvalidateRect(hwnd, WindowRect, true);
+                //  UpdateWindow(hwnd);
                 break;
             }
         }
-    case WM_PAINT:
-    {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-
-        // All painting occurs here, between BeginPaint and EndPaint.
-        FillRect(hdc, &ps.rcPaint, (HBRUSH)GetStockObject(Theme));
-
-        // State machine
-        switch (WindowState)
-        {
-        case MAINMENU:
-            MainMenu(hdc, ps);
-            break;
-        case EDITOR:
-            Editor(hdc, ps);
-            break;
-        }
-
-        EndPaint(hwnd, &ps);
-    }
-    break;
     }
 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-void Editor(HDC hdc, PAINTSTRUCT &ps)
+void EditorWindow(HDC hdc, PAINTSTRUCT &ps)
 {
     EditorHeaderRect.bottom = 18;
     EditorHeaderRect.left = 50;
@@ -240,6 +589,13 @@ void Editor(HDC hdc, PAINTSTRUCT &ps)
                          y ---> #----------#
                         
                             */
+
+    // Display the characters
+    // Set the clipping rectangle, and then draw the text
+    // into it.
+    // SetRect(&EditorRect, 0, 300, dwLineLen, dwClientY);
+    // DrawText(hdc, pchInputBuf, -1, &EditorRect, DT_LEFT);
+    // ShowCaret(hwnd);
 
     // Open a handle to the file
     hFile = CreateFile(
@@ -311,8 +667,6 @@ void Editor(HDC hdc, PAINTSTRUCT &ps)
     SendMessage(hwndEditorNewFileButton, WM_SETFONT, (WPARAM)hFontHeaderButton, TRUE);
     SendMessage(hwndEditorRecentFileButton, WM_SETFONT, (WPARAM)hFontHeaderButton, TRUE);
     SendMessage(hwndEditorThemeButton, WM_SETFONT, (WPARAM)hFontHeaderButton, TRUE);
-
-    DrawText(hdc, test, -1, &rect, DT_SINGLELINE | DT_NOCLIP | DT_LEFT | DT_VCENTER);
 
     ShowWindow(hwndEditorNewFileButton, SW_SHOW);
     ShowWindow(hwndEditorRecentFileButton, SW_SHOW);
@@ -414,11 +768,11 @@ void MainMenu(HDC hdc, PAINTSTRUCT &ps)
     ShowWindow(hwndNewFileButton, SW_SHOW);
 }
 
-void debug()
+void debug(LPCWSTR text)
 {
     MessageBox(
         NULL,
-        L"Works!",
-        L"Got it!",
+        text,
+        L"Alert",
         MB_ICONEXCLAMATION);
 }
